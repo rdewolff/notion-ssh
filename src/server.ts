@@ -41,29 +41,46 @@ async function main(): Promise<void> {
   const hostKey = ensureHostKey(env.SSH_HOST_KEY_PATH);
   const notion = new NotionGateway(env.NOTION_API_KEY);
   const vfs = new VirtualFs(notion, env.CACHE_TTL_SECONDS, env.NOTION_ROOT_PAGE_ID);
+  const startupRefreshStartedAt = Date.now();
+
+  void vfs
+    .refresh(false)
+    .then(() => {
+      logger.info(
+        { durationMs: Date.now() - startupRefreshStartedAt },
+        'Initial Notion index warm-up completed'
+      );
+    })
+    .catch((error) => {
+      logger.warn({ err: error }, 'Initial Notion index warm-up failed');
+    });
 
   const server = new Server({ hostKeys: [hostKey] }, (client) => {
     client.on('authentication', (ctx) => {
       if (ctx.method !== 'password') {
+        logger.warn({ method: ctx.method, username: ctx.username }, 'Rejected SSH auth method');
         ctx.reject(['password']);
         return;
       }
 
       if (env.SSH_ALLOW_ANY_PASSWORD) {
+        logger.info({ username: ctx.username }, 'Accepted SSH auth (allow-any-password mode)');
         ctx.accept();
         return;
       }
 
       const valid = ctx.username === env.SSH_USERNAME && ctx.password === env.SSH_PASSWORD;
       if (valid) {
+        logger.info({ username: ctx.username }, 'Accepted SSH auth');
         ctx.accept();
       } else {
+        logger.warn({ username: ctx.username }, 'Rejected SSH auth (invalid credentials)');
         ctx.reject(['password']);
       }
     });
 
     client.on('ready', () => {
-      logger.info('SSH client connected');
+      logger.info('SSH client connected and ready');
       client.on('session', (accept) => {
         const session = accept();
 

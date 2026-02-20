@@ -50,6 +50,9 @@ export class VirtualFs {
   private readonly cache = new Map<string, MarkdownCacheEntry>();
   private readonly notionPages = new Map<string, NotionRecordMeta>();
   private readonly ttlMs: number;
+  private refreshPromise: Promise<void> | null = null;
+  private lastRefreshAt = 0;
+  private indexedAtLeastOnce = false;
 
   constructor(
     private readonly notion: NotionGateway,
@@ -156,6 +159,14 @@ export class VirtualFs {
     return resolveVirtualPath(pathInput, cwd);
   }
 
+  isIndexed(): boolean {
+    return this.indexedAtLeastOnce;
+  }
+
+  isRefreshing(): boolean {
+    return this.refreshPromise !== null;
+  }
+
   private entryAt(pathInput: string, cwd = '/'): FsEntry | undefined {
     return this.entries.get(this.resolve(pathInput, cwd));
   }
@@ -230,84 +241,103 @@ export class VirtualFs {
     return posix.join(parentPath, `${filename}-${i}`);
   }
 
-  async refresh(): Promise<void> {
-    const { pages, databases } = await this.notion.listRecords(this.rootPageId);
-
-    this.reset();
-    for (const page of pages) {
-      this.notionPages.set(page.id, page);
+  async refresh(force = true): Promise<void> {
+    const now = Date.now();
+    const refreshIsFresh = this.indexedAtLeastOnce && now - this.lastRefreshAt < this.ttlMs;
+    if (!force && refreshIsFresh) {
+      return;
     }
 
-    const eligiblePages = pages.filter((page) => page.parent?.type !== 'database_id');
-    const childrenByParentPage = new Map<string, NotionRecordMeta[]>();
-    const roots: NotionRecordMeta[] = [];
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
 
-    for (const page of eligiblePages) {
-      const parent = page.parent;
-      if (parent?.type === 'page_id') {
-        if (!this.notionPages.has(parent.page_id)) {
+    this.refreshPromise = (async () => {
+      const { pages, databases } = await this.notion.listRecords(this.rootPageId);
+
+      this.reset();
+      for (const page of pages) {
+        this.notionPages.set(page.id, page);
+      }
+
+      const eligiblePages = pages.filter((page) => page.parent?.type !== 'database_id');
+      const childrenByParentPage = new Map<string, NotionRecordMeta[]>();
+      const roots: NotionRecordMeta[] = [];
+
+      for (const page of eligiblePages) {
+        const parent = page.parent;
+        if (parent?.type === 'page_id') {
+          if (!this.notionPages.has(parent.page_id)) {
+            roots.push(page);
+            continue;
+          }
+
+          const children = childrenByParentPage.get(parent.page_id) ?? [];
+          children.push(page);
+          childrenByParentPage.set(parent.page_id, children);
+        } else {
           roots.push(page);
-          continue;
-        }
-
-        const children = childrenByParentPage.get(parent.page_id) ?? [];
-        children.push(page);
-        childrenByParentPage.set(parent.page_id, children);
-      } else {
-        roots.push(page);
-      }
-    }
-
-    const siblingNamesByPath = new Map<string, Set<string>>();
-
-    const buildPageTree = (page: NotionRecordMeta, parentPath: string): void => {
-      const used = siblingNamesByPath.get(parentPath) ?? new Set<string>();
-      siblingNamesByPath.set(parentPath, used);
-
-      const base = slugFromTitle(page.title);
-      const dirName = uniqueName(base, used, page.id);
-      const dirPath = posix.join(parentPath, dirName);
-
-      this.addDir(dirPath, dirName, parentPath, {
-        pageId: page.id,
-        owner: page.owner,
-        createdTime: page.createdTime,
-        lastEditedTime: page.lastEditedTime
-      });
-      this.pageDirPathById.set(page.id, dirPath);
-
-      this.addPageFile(posix.join(dirPath, 'index.md'), dirPath, page);
-
-      const children = childrenByParentPage.get(page.id) ?? [];
-      children.sort((a, b) => a.title.localeCompare(b.title));
-      for (const child of children) {
-        buildPageTree(child, dirPath);
-      }
-    };
-
-    roots.sort((a, b) => a.title.localeCompare(b.title));
-    for (const root of roots) {
-      buildPageTree(root, '/pages');
-    }
-
-    const dbNamesByParent = new Map<string, Set<string>>();
-    for (const database of databases) {
-      let parentPath = '/pages';
-      if (database.parent?.type === 'page_id') {
-        const parentDir = this.pageDirPathById.get(database.parent.page_id);
-        if (parentDir) {
-          parentPath = parentDir;
         }
       }
 
-      const used = dbNamesByParent.get(parentPath) ?? new Set<string>();
-      dbNamesByParent.set(parentPath, used);
+      const siblingNamesByPath = new Map<string, Set<string>>();
 
-      const base = `[db:${shortId(database.id)}]`;
-      const name = uniqueName(base, used, database.id);
-      const dbPath = this.findUniquePath(parentPath, name);
-      this.addDbPlaceholder(dbPath, name, parentPath, database);
-    }
+      const buildPageTree = (page: NotionRecordMeta, parentPath: string): void => {
+        const used = siblingNamesByPath.get(parentPath) ?? new Set<string>();
+        siblingNamesByPath.set(parentPath, used);
+
+        const base = slugFromTitle(page.title);
+        const dirName = uniqueName(base, used, page.id);
+        const dirPath = posix.join(parentPath, dirName);
+
+        this.addDir(dirPath, dirName, parentPath, {
+          pageId: page.id,
+          owner: page.owner,
+          createdTime: page.createdTime,
+          lastEditedTime: page.lastEditedTime
+        });
+        this.pageDirPathById.set(page.id, dirPath);
+
+        this.addPageFile(posix.join(dirPath, 'index.md'), dirPath, page);
+
+        const children = childrenByParentPage.get(page.id) ?? [];
+        children.sort((a, b) => a.title.localeCompare(b.title));
+        for (const child of children) {
+          buildPageTree(child, dirPath);
+        }
+      };
+
+      roots.sort((a, b) => a.title.localeCompare(b.title));
+      for (const root of roots) {
+        buildPageTree(root, '/pages');
+      }
+
+      const dbNamesByParent = new Map<string, Set<string>>();
+      for (const database of databases) {
+        let parentPath = '/pages';
+        if (database.parent?.type === 'page_id') {
+          const parentDir = this.pageDirPathById.get(database.parent.page_id);
+          if (parentDir) {
+            parentPath = parentDir;
+          }
+        }
+
+        const used = dbNamesByParent.get(parentPath) ?? new Set<string>();
+        dbNamesByParent.set(parentPath, used);
+
+        const base = `[db:${shortId(database.id)}]`;
+        const name = uniqueName(base, used, database.id);
+        const dbPath = this.findUniquePath(parentPath, name);
+        this.addDbPlaceholder(dbPath, name, parentPath, database);
+      }
+
+      this.indexedAtLeastOnce = true;
+      this.lastRefreshAt = Date.now();
+    })().finally(() => {
+      this.refreshPromise = null;
+    });
+
+    return this.refreshPromise;
   }
 
   list(pathInput: string, cwd = '/'): FsEntry[] {

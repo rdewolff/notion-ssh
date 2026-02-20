@@ -44,6 +44,7 @@ function nameForEntry(entry: FsEntry): string {
 export class ShellSession {
   private cwd = '/pages';
   private editState: EditState | null = null;
+  private isClosed = false;
   private readonly rl: readline.Interface;
 
   constructor(
@@ -59,23 +60,35 @@ export class ShellSession {
   }
 
   async start(): Promise<void> {
-    try {
-      await this.vfs.refresh();
-    } catch (error) {
-      this.logger.error({ err: error }, 'Failed to refresh virtual filesystem during session start');
-      this.writeLine(`warning: failed to load Notion index: ${(error as Error).message}`);
-    }
-
     this.writeLine('Notion SSH Virtual Manager');
     this.writeLine('Type "help" for commands.');
+    if (!this.vfs.isIndexed()) {
+      this.writeLine('Index warm-up started in background. First data command may take longer.');
+    }
     this.writePrompt();
+
+    const start = Date.now();
+    void this.vfs
+      .refresh(false)
+      .then(() => {
+        this.logger.info({ durationMs: Date.now() - start }, 'Background Notion index warm-up completed');
+      })
+      .catch((error) => {
+        this.logger.error({ err: error }, 'Failed to refresh virtual filesystem during session start');
+        if (!this.channel.destroyed) {
+          this.writeLine(`warning: failed to load Notion index: ${(error as Error).message}`);
+        }
+      });
 
     this.rl.on('line', (line) => {
       void this.handleLine(line);
     });
 
     this.rl.on('close', () => {
-      this.channel.end();
+      this.isClosed = true;
+      if (!this.channel.destroyed) {
+        this.channel.end();
+      }
     });
   }
 
@@ -84,6 +97,9 @@ export class ShellSession {
   }
 
   private write(text: string): void {
+    if (this.isClosed || this.channel.destroyed) {
+      return;
+    }
     this.channel.write(text);
   }
 
@@ -99,6 +115,9 @@ export class ShellSession {
   }
 
   private writePrompt(): void {
+    if (this.isClosed || this.channel.destroyed) {
+      return;
+    }
     this.rl.setPrompt(this.promptLabel());
     this.rl.prompt();
   }
@@ -114,7 +133,7 @@ export class ShellSession {
       this.writeLine(`error: ${(error as Error).message}`);
     }
 
-    if (!this.channel.destroyed) {
+    if (!this.isClosed && !this.channel.destroyed) {
       this.writePrompt();
     }
   }
@@ -170,6 +189,8 @@ export class ShellSession {
     }
 
     if (command === 'ls') {
+      await this.ensureIndexed();
+
       let longFormat = false;
       let target = this.cwd;
 
@@ -193,6 +214,8 @@ export class ShellSession {
     }
 
     if (command === 'cd') {
+      await this.ensureIndexed();
+
       const target = parsed.args[0] ?? '/pages';
       const entry = this.vfs.stat(target, this.cwd);
       if (!entry) {
@@ -206,6 +229,8 @@ export class ShellSession {
     }
 
     if (command === 'cat') {
+      await this.ensureIndexed();
+
       const target = parsed.args[0];
       if (!target) {
         throw new Error('Usage: cat <file|dir>');
@@ -218,6 +243,8 @@ export class ShellSession {
     }
 
     if (command === 'grep') {
+      await this.ensureIndexed();
+
       let recursive = false;
       let ignoreCase = false;
       const positional: string[] = [];
@@ -251,6 +278,8 @@ export class ShellSession {
     }
 
     if (command === 'touch') {
+      await this.ensureIndexed();
+
       const target = parsed.args[0];
       if (!target) {
         throw new Error('Usage: touch <path>');
@@ -261,6 +290,8 @@ export class ShellSession {
     }
 
     if (command === 'mkdir') {
+      await this.ensureIndexed();
+
       const target = parsed.args[0];
       if (!target) {
         throw new Error('Usage: mkdir <path>');
@@ -271,12 +302,14 @@ export class ShellSession {
     }
 
     if (command === 'refresh') {
-      await this.vfs.refresh();
+      await this.ensureIndexed(true);
       this.writeLine('index refreshed');
       return;
     }
 
     if (command === 'edit' || command === 'vim') {
+      await this.ensureIndexed();
+
       const target = parsed.args[0];
       if (!target) {
         throw new Error(`Usage: ${command} <file|dir>`);
@@ -286,11 +319,31 @@ export class ShellSession {
     }
 
     if (command === 'exit' || command === 'quit' || command === 'logout') {
+      this.isClosed = true;
       this.rl.close();
       return;
     }
 
     throw new Error(`Unknown command: ${command}`);
+  }
+
+  private async ensureIndexed(force = false): Promise<void> {
+    const needsNotice = !this.vfs.isIndexed() || this.vfs.isRefreshing() || force;
+    if (needsNotice) {
+      this.writeLine('(syncing Notion index...)');
+    }
+
+    const start = Date.now();
+    await this.vfs.refresh(force);
+    const durationMs = Date.now() - start;
+
+    if (needsNotice) {
+      this.writeLine(`(Notion index ready in ${durationMs}ms)`);
+    }
+
+    if (durationMs > 750) {
+      this.logger.info({ durationMs, force }, 'Notion index sync completed');
+    }
   }
 
   private printEditBuffer(): void {

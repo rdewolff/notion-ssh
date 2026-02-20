@@ -48,6 +48,7 @@ Useful options:
 - `vim <path>` is an alias to the built-in mini editor (not full-screen Vim)
 - `grep -r <pattern> [path]` searches recursively
 - `touch <name>` creates a new Notion page
+- Shell prompt appears immediately; if the Notion index is cold, the first data command may show a sync message and take longer.
 
 ## Build and test
 ```bash
