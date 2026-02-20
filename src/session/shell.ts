@@ -11,6 +11,29 @@ interface EditState {
   buffer: string[];
 }
 
+interface ListRenderOptions {
+  includeDatabases: boolean;
+  includeIndexFile: boolean;
+}
+
+const COMMANDS = [
+  'help',
+  'pwd',
+  'ls',
+  'tree',
+  'cd',
+  'cat',
+  'grep',
+  'touch',
+  'mkdir',
+  'edit',
+  'vim',
+  'refresh',
+  'exit',
+  'quit',
+  'logout'
+];
+
 function formatTime(value?: string): string {
   if (!value) {
     return '-';
@@ -45,6 +68,7 @@ export class ShellSession {
   private cwd = '/pages';
   private editState: EditState | null = null;
   private isClosed = false;
+  private lastCachedNoticeAt = 0;
   private readonly rl: readline.Interface;
 
   constructor(
@@ -55,7 +79,8 @@ export class ShellSession {
     this.rl = readline.createInterface({
       input: this.channel,
       output: this.channel,
-      terminal: true
+      terminal: true,
+      completer: (line: string) => this.completeLine(line)
     });
   }
 
@@ -140,13 +165,14 @@ export class ShellSession {
 
   private printHelp(): void {
     this.writeLine('Available commands:');
+    this.writeLine('  (Tab completion available for commands and paths)');
     this.writeLine('  help                         Show this help');
     this.writeLine('  pwd                          Print current directory');
-    this.writeLine('  ls [-l] [path]               List files/pages');
+    this.writeLine('  ls [-l] [-a|--all] [--db] [path] List files/pages');
     this.writeLine('  cd <path>                    Change directory');
     this.writeLine('  cat <file|dir>               Print Markdown content');
     this.writeLine('  grep [-r] [-i] <pat> [path]  Search in Markdown files');
-    this.writeLine('  tree [-L depth] [path]        Print directory tree');
+    this.writeLine('  tree [-L depth] [--db] [path] Print directory tree (default depth: 2)');
     this.writeLine('  touch <path>                 Create a new page');
     this.writeLine('  mkdir <path>                 Create a new page directory');
     this.writeLine('  edit <file|dir>              Open mini editor');
@@ -167,11 +193,165 @@ export class ShellSession {
   }
 
   private printShortLs(entries: FsEntry[]): void {
-    const names = entries.map(nameForEntry);
-    this.writeLine(names.join('  '));
+    if (entries.length === 0) {
+      this.writeLine('(empty)');
+      return;
+    }
+
+    for (const entry of entries) {
+      const kind = entry.type === 'dir' ? 'd' : entry.type === 'db' ? 'D' : 'f';
+      this.writeLine(`${kind} ${nameForEntry(entry)}`);
+    }
   }
 
-  private printTree(pathInput: string, cwd: string, maxDepth: number): void {
+  private renderHiddenSummary(hiddenDatabases: number, hiddenIndex: number): void {
+    const chunks: string[] = [];
+    if (hiddenDatabases > 0) {
+      chunks.push(`${hiddenDatabases} database placeholders hidden (--db to show)`);
+    }
+    if (hiddenIndex > 0) {
+      chunks.push(`${hiddenIndex} index.md hidden (--all to show)`);
+    }
+    if (chunks.length > 0) {
+      this.writeLine(`(${chunks.join(', ')})`);
+    }
+  }
+
+  private filterEntries(entries: FsEntry[], options: ListRenderOptions): {
+    visible: FsEntry[];
+    hiddenDatabases: number;
+    hiddenIndex: number;
+  } {
+    let hiddenDatabases = 0;
+    let hiddenIndex = 0;
+    const visible: FsEntry[] = [];
+
+    for (const entry of entries) {
+      if (!options.includeDatabases && entry.type === 'db') {
+        hiddenDatabases += 1;
+        continue;
+      }
+      if (!options.includeIndexFile && entry.type === 'file' && entry.name === 'index.md') {
+        hiddenIndex += 1;
+        continue;
+      }
+      visible.push(entry);
+    }
+
+    return { visible, hiddenDatabases, hiddenIndex };
+  }
+
+  private completeLine(line: string): [string[], string] {
+    if (this.editState) {
+      return [[], line];
+    }
+
+    const endsWithSpace = /\s$/.test(line);
+    const trimmed = line.trimStart();
+    const parts = trimmed.length > 0 ? trimmed.split(/\s+/) : [];
+    if (parts.length === 0) {
+      return [COMMANDS.slice(), line];
+    }
+
+    const command = parts[0].toLowerCase();
+    if (parts.length === 1 && !endsWithSpace) {
+      const matches = COMMANDS.filter((candidate) => candidate.startsWith(command));
+      return [matches.length > 0 ? matches : COMMANDS.slice(), command];
+    }
+
+    const pathCommands = new Set(['ls', 'tree', 'cd', 'cat', 'touch', 'mkdir', 'edit', 'vim']);
+    if (!pathCommands.has(command)) {
+      return [[], line];
+    }
+
+    const token = endsWithSpace ? '' : parts[parts.length - 1];
+    if (token.startsWith('-')) {
+      return [[], token];
+    }
+
+    const tokenDir = token.includes('/') ? token.slice(0, token.lastIndexOf('/')) : '';
+    const prefix = token.includes('/') ? token.slice(token.lastIndexOf('/') + 1) : token;
+    const lookupPath = token.startsWith('/')
+      ? tokenDir || '/'
+      : tokenDir.length > 0
+        ? tokenDir
+        : '.';
+
+    let entries: FsEntry[] = [];
+    try {
+      entries = this.vfs.list(lookupPath, this.cwd);
+    } catch {
+      return [[], token];
+    }
+
+    const candidates = entries
+      .filter((entry) => {
+        if (entry.type === 'db') {
+          return false;
+        }
+        if (command === 'cd') {
+          return entry.type === 'dir';
+        }
+        return true;
+      })
+      .map((entry) => {
+        const leaf = entry.type === 'dir' ? `${entry.name}/` : entry.name;
+        if (token.startsWith('/')) {
+          const baseDir = tokenDir || '/';
+          return baseDir === '/' ? `/${leaf}` : `${baseDir}/${leaf}`;
+        }
+        if (tokenDir.length > 0) {
+          return `${tokenDir}/${leaf}`;
+        }
+        return leaf;
+      })
+      .filter((candidate) => {
+        const normalized = candidate.endsWith('/') ? candidate.slice(0, -1) : candidate;
+        const basename = normalized.split('/').pop() ?? '';
+        return basename.startsWith(prefix);
+      })
+      .sort((a, b) => a.localeCompare(b));
+
+    return [candidates, token];
+  }
+
+  private expandPathPrefix(pathInput: string, dirOnly: boolean): string {
+    const resolved = this.vfs.resolve(pathInput, this.cwd);
+    const existing = this.vfs.stat(resolved, this.cwd);
+    if (existing) {
+      return resolved;
+    }
+
+    const slash = resolved.lastIndexOf('/');
+    const parentPath = slash > 0 ? resolved.slice(0, slash) : '/';
+    const needle = resolved.slice(slash + 1);
+    if (needle.length === 0) {
+      return resolved;
+    }
+
+    const parent = this.vfs.stat(parentPath, this.cwd);
+    if (!parent || parent.type !== 'dir') {
+      return resolved;
+    }
+
+    const matches = this.vfs
+      .list(parentPath, this.cwd)
+      .filter((entry) => (!dirOnly || entry.type === 'dir') && entry.type !== 'db')
+      .filter((entry) => entry.name.startsWith(needle));
+
+    if (matches.length === 1) {
+      return matches[0].path;
+    }
+
+    if (matches.length > 1) {
+      const labels = matches.slice(0, 8).map((entry) => nameForEntry(entry));
+      throw new Error(`Ambiguous path "${pathInput}": ${labels.join(', ')}`);
+    }
+
+    return resolved;
+  }
+
+  private printTree(pathInput: string, cwd: string, maxDepth: number, options: ListRenderOptions): void {
     const root = this.vfs.stat(pathInput, cwd);
     if (!root) {
       throw new Error(`No such path: ${this.vfs.resolve(pathInput, cwd)}`);
@@ -182,13 +362,21 @@ export class ShellSession {
 
     const rootLabel = root.path === '/pages' ? 'pages/' : `${root.name}/`;
     this.writeLine(rootLabel);
+    let hiddenDatabases = 0;
+    let hiddenIndex = 0;
 
     const walk = (dirPath: string, prefix: string, depthLeft: number): void => {
       if (depthLeft <= 0) {
         return;
       }
 
-      const children = this.vfs.list(dirPath, cwd).filter((entry) => !(entry.type === 'file' && entry.name === 'index.md'));
+      const filtered = this.filterEntries(this.vfs.list(dirPath, cwd), options);
+      hiddenDatabases += filtered.hiddenDatabases;
+      hiddenIndex += filtered.hiddenIndex;
+      const children = filtered.visible;
+      if (children.length === 0 && prefix.length === 0) {
+        this.writeLine('(empty)');
+      }
       for (let i = 0; i < children.length; i += 1) {
         const child = children[i];
         const isLast = i === children.length - 1;
@@ -203,6 +391,7 @@ export class ShellSession {
     };
 
     walk(root.path, '', maxDepth);
+    this.renderHiddenSummary(hiddenDatabases, hiddenIndex);
   }
 
   private async dispatch(commandLine: string): Promise<void> {
@@ -228,33 +417,52 @@ export class ShellSession {
 
       let longFormat = false;
       let target = this.cwd;
+      let includeDatabases = false;
+      let includeIndexFile = false;
 
       for (const arg of parsed.args) {
         if (arg.startsWith('-')) {
           if (arg.includes('l')) {
             longFormat = true;
           }
+          if (arg.includes('a')) {
+            includeDatabases = true;
+            includeIndexFile = true;
+          }
+          if (arg === '--db') {
+            includeDatabases = true;
+          }
+          if (arg === '--all') {
+            includeDatabases = true;
+            includeIndexFile = true;
+          }
           continue;
         }
         target = arg;
       }
 
-      const entries = this.vfs.list(target, this.cwd);
+      const filtered = this.filterEntries(this.vfs.list(target, this.cwd), {
+        includeDatabases,
+        includeIndexFile
+      });
+      const entries = filtered.visible;
       if (longFormat) {
         this.printLongLs(entries);
       } else {
         this.printShortLs(entries);
       }
+      this.renderHiddenSummary(filtered.hiddenDatabases, filtered.hiddenIndex);
       return;
     }
 
     if (command === 'cd') {
       await this.ensureIndexed();
 
-      const target = parsed.args[0] ?? '/pages';
+      const targetInput = parsed.args[0] ?? '/pages';
+      const target = this.expandPathPrefix(targetInput, true);
       const entry = this.vfs.stat(target, this.cwd);
       if (!entry) {
-        throw new Error(`No such path: ${this.vfs.resolve(target, this.cwd)}`);
+        throw new Error(`No such path: ${this.vfs.resolve(targetInput, this.cwd)}`);
       }
       if (entry.type !== 'dir') {
         throw new Error(`Not a directory: ${entry.path}`);
@@ -316,7 +524,8 @@ export class ShellSession {
       await this.ensureIndexed();
 
       let target = this.cwd;
-      let depth = Number.POSITIVE_INFINITY;
+      let depth = 2;
+      let includeDatabases = false;
       const args = [...parsed.args];
       for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
@@ -333,11 +542,18 @@ export class ShellSession {
           i += 1;
           continue;
         }
+        if (arg === '--db') {
+          includeDatabases = true;
+          continue;
+        }
 
         target = arg;
       }
 
-      this.printTree(target, this.cwd, depth);
+      this.printTree(target, this.cwd, depth, {
+        includeDatabases,
+        includeIndexFile: false
+      });
       return;
     }
 
@@ -430,7 +646,11 @@ export class ShellSession {
       });
 
     if (this.vfs.isRefreshing()) {
-      this.writeLine('(using cached index while background refresh runs)');
+      const now = Date.now();
+      if (now - this.lastCachedNoticeAt > 15000) {
+        this.writeLine('(using cached index while background refresh runs)');
+        this.lastCachedNoticeAt = now;
+      }
     }
   }
 

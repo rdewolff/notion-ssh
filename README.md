@@ -45,7 +45,10 @@ Useful options:
 - `SSH_ALLOW_ANY_PASSWORD`: set `true` for local testing only
 
 ## Command notes
-- `tree [path]` prints the hierarchy as a tree (`tree -L 2` limits depth)
+- Press `Tab` for command/path completion (for `cd`, `ls`, `tree`, `cat`, `edit`, etc.)
+- `cd` also accepts unique prefixes (`cd bu` -> `cd business`)
+- `ls` hides database placeholders and `index.md` by default (`ls -a` or `ls --db` to show more)
+- `tree [path]` prints hierarchy (default depth is 2; use `tree -L 4` for deeper)
 - `cat <dir>` resolves to `<dir>/index.md`
 - `vim <path>` is an alias to the built-in mini editor (not full-screen Vim)
 - `grep -r <pattern> [path]` searches recursively
