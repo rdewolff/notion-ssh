@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 import slugify from 'slugify';
@@ -12,6 +13,13 @@ interface MarkdownCacheEntry {
   markdown: string;
   fetchedAt: number;
   lastEditedTime: string | undefined;
+}
+
+interface IndexSnapshotV1 {
+  version: 1;
+  savedAt: number;
+  pages: NotionRecordMeta[];
+  databases: NotionRecordMeta[];
 }
 
 function shortId(id: string): string {
@@ -50,6 +58,7 @@ export class VirtualFs {
   private readonly cache = new Map<string, MarkdownCacheEntry>();
   private readonly notionPages = new Map<string, NotionRecordMeta>();
   private readonly ttlMs: number;
+  private readonly snapshotPath: string;
   private refreshPromise: Promise<void> | null = null;
   private lastRefreshAt = 0;
   private indexedAtLeastOnce = false;
@@ -60,7 +69,9 @@ export class VirtualFs {
     private readonly rootPageId?: string
   ) {
     this.ttlMs = cacheTtlSeconds * 1000;
+    this.snapshotPath = path.resolve(process.cwd(), '.cache/notion-index.json');
     this.reset();
+    this.loadSnapshotFromDisk();
   }
 
   private reset(): void {
@@ -241,6 +252,121 @@ export class VirtualFs {
     return posix.join(parentPath, `${filename}-${i}`);
   }
 
+  private buildIndex(pages: NotionRecordMeta[], databases: NotionRecordMeta[]): void {
+    this.reset();
+    for (const page of pages) {
+      this.notionPages.set(page.id, page);
+    }
+
+    const eligiblePages = pages.filter(
+      (page) => page.parent?.type !== 'database_id' && page.parent?.type !== 'data_source_id'
+    );
+    const childrenByParentPage = new Map<string, NotionRecordMeta[]>();
+    const roots: NotionRecordMeta[] = [];
+
+    for (const page of eligiblePages) {
+      const parent = page.parent;
+      if (parent?.type === 'page_id') {
+        if (!this.notionPages.has(parent.page_id)) {
+          roots.push(page);
+          continue;
+        }
+
+        const children = childrenByParentPage.get(parent.page_id) ?? [];
+        children.push(page);
+        childrenByParentPage.set(parent.page_id, children);
+      } else {
+        roots.push(page);
+      }
+    }
+
+    const siblingNamesByPath = new Map<string, Set<string>>();
+
+    const buildPageTree = (page: NotionRecordMeta, parentPath: string): void => {
+      const used = siblingNamesByPath.get(parentPath) ?? new Set<string>();
+      siblingNamesByPath.set(parentPath, used);
+
+      const base = slugFromTitle(page.title);
+      const dirName = uniqueName(base, used, page.id);
+      const dirPath = posix.join(parentPath, dirName);
+
+      this.addDir(dirPath, dirName, parentPath, {
+        pageId: page.id,
+        owner: page.owner,
+        createdTime: page.createdTime,
+        lastEditedTime: page.lastEditedTime
+      });
+      this.pageDirPathById.set(page.id, dirPath);
+
+      this.addPageFile(posix.join(dirPath, 'index.md'), dirPath, page);
+
+      const children = childrenByParentPage.get(page.id) ?? [];
+      children.sort((a, b) => a.title.localeCompare(b.title));
+      for (const child of children) {
+        buildPageTree(child, dirPath);
+      }
+    };
+
+    roots.sort((a, b) => a.title.localeCompare(b.title));
+    for (const root of roots) {
+      buildPageTree(root, '/pages');
+    }
+
+    const dbNamesByParent = new Map<string, Set<string>>();
+    for (const database of databases) {
+      let parentPath = '/pages';
+      if (database.parent?.type === 'page_id') {
+        const parentDir = this.pageDirPathById.get(database.parent.page_id);
+        if (parentDir) {
+          parentPath = parentDir;
+        }
+      }
+
+      const used = dbNamesByParent.get(parentPath) ?? new Set<string>();
+      dbNamesByParent.set(parentPath, used);
+
+      const base = `[db:${shortId(database.id)}]`;
+      const name = uniqueName(base, used, database.id);
+      const dbPath = this.findUniquePath(parentPath, name);
+      this.addDbPlaceholder(dbPath, name, parentPath, database);
+    }
+  }
+
+  private loadSnapshotFromDisk(): void {
+    try {
+      if (!fs.existsSync(this.snapshotPath)) {
+        return;
+      }
+
+      const raw = fs.readFileSync(this.snapshotPath, 'utf8');
+      const snapshot = JSON.parse(raw) as IndexSnapshotV1;
+      if (snapshot.version !== 1 || !Array.isArray(snapshot.pages) || !Array.isArray(snapshot.databases)) {
+        return;
+      }
+
+      this.buildIndex(snapshot.pages, snapshot.databases);
+      this.indexedAtLeastOnce = true;
+      this.lastRefreshAt = typeof snapshot.savedAt === 'number' ? snapshot.savedAt : Date.now();
+    } catch {
+      // Ignore cache load failures and fall back to live indexing.
+    }
+  }
+
+  private persistSnapshot(pages: NotionRecordMeta[], databases: NotionRecordMeta[]): void {
+    try {
+      fs.mkdirSync(path.dirname(this.snapshotPath), { recursive: true });
+      const payload: IndexSnapshotV1 = {
+        version: 1,
+        savedAt: Date.now(),
+        pages,
+        databases
+      };
+      fs.writeFileSync(this.snapshotPath, `${JSON.stringify(payload)}\n`, 'utf8');
+    } catch {
+      // Cache persistence is best-effort.
+    }
+  }
+
   async refresh(force = true): Promise<void> {
     const now = Date.now();
     const refreshIsFresh = this.indexedAtLeastOnce && now - this.lastRefreshAt < this.ttlMs;
@@ -254,82 +380,8 @@ export class VirtualFs {
 
     this.refreshPromise = (async () => {
       const { pages, databases } = await this.notion.listRecords(this.rootPageId);
-
-      this.reset();
-      for (const page of pages) {
-        this.notionPages.set(page.id, page);
-      }
-
-      const eligiblePages = pages.filter((page) => page.parent?.type !== 'database_id');
-      const childrenByParentPage = new Map<string, NotionRecordMeta[]>();
-      const roots: NotionRecordMeta[] = [];
-
-      for (const page of eligiblePages) {
-        const parent = page.parent;
-        if (parent?.type === 'page_id') {
-          if (!this.notionPages.has(parent.page_id)) {
-            roots.push(page);
-            continue;
-          }
-
-          const children = childrenByParentPage.get(parent.page_id) ?? [];
-          children.push(page);
-          childrenByParentPage.set(parent.page_id, children);
-        } else {
-          roots.push(page);
-        }
-      }
-
-      const siblingNamesByPath = new Map<string, Set<string>>();
-
-      const buildPageTree = (page: NotionRecordMeta, parentPath: string): void => {
-        const used = siblingNamesByPath.get(parentPath) ?? new Set<string>();
-        siblingNamesByPath.set(parentPath, used);
-
-        const base = slugFromTitle(page.title);
-        const dirName = uniqueName(base, used, page.id);
-        const dirPath = posix.join(parentPath, dirName);
-
-        this.addDir(dirPath, dirName, parentPath, {
-          pageId: page.id,
-          owner: page.owner,
-          createdTime: page.createdTime,
-          lastEditedTime: page.lastEditedTime
-        });
-        this.pageDirPathById.set(page.id, dirPath);
-
-        this.addPageFile(posix.join(dirPath, 'index.md'), dirPath, page);
-
-        const children = childrenByParentPage.get(page.id) ?? [];
-        children.sort((a, b) => a.title.localeCompare(b.title));
-        for (const child of children) {
-          buildPageTree(child, dirPath);
-        }
-      };
-
-      roots.sort((a, b) => a.title.localeCompare(b.title));
-      for (const root of roots) {
-        buildPageTree(root, '/pages');
-      }
-
-      const dbNamesByParent = new Map<string, Set<string>>();
-      for (const database of databases) {
-        let parentPath = '/pages';
-        if (database.parent?.type === 'page_id') {
-          const parentDir = this.pageDirPathById.get(database.parent.page_id);
-          if (parentDir) {
-            parentPath = parentDir;
-          }
-        }
-
-        const used = dbNamesByParent.get(parentPath) ?? new Set<string>();
-        dbNamesByParent.set(parentPath, used);
-
-        const base = `[db:${shortId(database.id)}]`;
-        const name = uniqueName(base, used, database.id);
-        const dbPath = this.findUniquePath(parentPath, name);
-        this.addDbPlaceholder(dbPath, name, parentPath, database);
-      }
+      this.buildIndex(pages, databases);
+      this.persistSnapshot(pages, databases);
 
       this.indexedAtLeastOnce = true;
       this.lastRefreshAt = Date.now();

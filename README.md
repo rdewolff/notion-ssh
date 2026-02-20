@@ -6,8 +6,9 @@ SSH virtual manager for Notion pages as Markdown files.
 - Exposes your Notion pages as a virtual tree under `/pages`
 - Supports nested pages recursively
 - Skips databases in MVP and shows placeholders like `[db:abcd1234]`
+- Persists an index cache at `.cache/notion-index.json` for faster warm starts
 - Lets you run shell-like commands over SSH:
-  - `ls`, `cd`, `pwd`, `cat`, `grep`, `touch`, `mkdir`, `edit` (`vim` alias), `refresh`
+  - `ls`, `tree`, `cd`, `pwd`, `cat`, `grep`, `touch`, `mkdir`, `edit` (`vim` alias), `refresh`
 
 ## Quick start
 1. Install dependencies:
@@ -44,11 +45,13 @@ Useful options:
 - `SSH_ALLOW_ANY_PASSWORD`: set `true` for local testing only
 
 ## Command notes
+- `tree [path]` prints the hierarchy as a tree (`tree -L 2` limits depth)
 - `cat <dir>` resolves to `<dir>/index.md`
 - `vim <path>` is an alias to the built-in mini editor (not full-screen Vim)
 - `grep -r <pattern> [path]` searches recursively
 - `touch <name>` creates a new Notion page
 - Shell prompt appears immediately; if the Notion index is cold, the first data command may show a sync message and take longer.
+- When an index refresh is already running, commands use cached hierarchy immediately and refresh in background.
 
 ## Build and test
 ```bash

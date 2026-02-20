@@ -146,6 +146,7 @@ export class ShellSession {
     this.writeLine('  cd <path>                    Change directory');
     this.writeLine('  cat <file|dir>               Print Markdown content');
     this.writeLine('  grep [-r] [-i] <pat> [path]  Search in Markdown files');
+    this.writeLine('  tree [-L depth] [path]        Print directory tree');
     this.writeLine('  touch <path>                 Create a new page');
     this.writeLine('  mkdir <path>                 Create a new page directory');
     this.writeLine('  edit <file|dir>              Open mini editor');
@@ -168,6 +169,40 @@ export class ShellSession {
   private printShortLs(entries: FsEntry[]): void {
     const names = entries.map(nameForEntry);
     this.writeLine(names.join('  '));
+  }
+
+  private printTree(pathInput: string, cwd: string, maxDepth: number): void {
+    const root = this.vfs.stat(pathInput, cwd);
+    if (!root) {
+      throw new Error(`No such path: ${this.vfs.resolve(pathInput, cwd)}`);
+    }
+    if (root.type !== 'dir') {
+      throw new Error(`Not a directory: ${root.path}`);
+    }
+
+    const rootLabel = root.path === '/pages' ? 'pages/' : `${root.name}/`;
+    this.writeLine(rootLabel);
+
+    const walk = (dirPath: string, prefix: string, depthLeft: number): void => {
+      if (depthLeft <= 0) {
+        return;
+      }
+
+      const children = this.vfs.list(dirPath, cwd).filter((entry) => !(entry.type === 'file' && entry.name === 'index.md'));
+      for (let i = 0; i < children.length; i += 1) {
+        const child = children[i];
+        const isLast = i === children.length - 1;
+        const branch = isLast ? '`-- ' : '|-- ';
+        this.writeLine(`${prefix}${branch}${nameForEntry(child)}`);
+
+        if (child.type === 'dir') {
+          const nextPrefix = `${prefix}${isLast ? '    ' : '|   '}`;
+          walk(child.path, nextPrefix, depthLeft - 1);
+        }
+      }
+    };
+
+    walk(root.path, '', maxDepth);
   }
 
   private async dispatch(commandLine: string): Promise<void> {
@@ -277,6 +312,35 @@ export class ShellSession {
       return;
     }
 
+    if (command === 'tree') {
+      await this.ensureIndexed();
+
+      let target = this.cwd;
+      let depth = Number.POSITIVE_INFINITY;
+      const args = [...parsed.args];
+      for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '-L') {
+          const depthValue = args[i + 1];
+          if (!depthValue) {
+            throw new Error('Usage: tree [-L depth] [path]');
+          }
+          const parsedDepth = Number(depthValue);
+          if (!Number.isInteger(parsedDepth) || parsedDepth <= 0) {
+            throw new Error(`Invalid tree depth: ${depthValue}`);
+          }
+          depth = parsedDepth;
+          i += 1;
+          continue;
+        }
+
+        target = arg;
+      }
+
+      this.printTree(target, this.cwd, depth);
+      return;
+    }
+
     if (command === 'touch') {
       await this.ensureIndexed();
 
@@ -328,21 +392,45 @@ export class ShellSession {
   }
 
   private async ensureIndexed(force = false): Promise<void> {
-    const needsNotice = !this.vfs.isIndexed() || this.vfs.isRefreshing() || force;
-    if (needsNotice) {
+    if (force) {
       this.writeLine('(syncing Notion index...)');
-    }
-
-    const start = Date.now();
-    await this.vfs.refresh(force);
-    const durationMs = Date.now() - start;
-
-    if (needsNotice) {
+      const start = Date.now();
+      await this.vfs.refresh(true);
+      const durationMs = Date.now() - start;
       this.writeLine(`(Notion index ready in ${durationMs}ms)`);
+      if (durationMs > 750) {
+        this.logger.info({ durationMs, force: true }, 'Notion index sync completed');
+      }
+      return;
     }
 
-    if (durationMs > 750) {
-      this.logger.info({ durationMs, force }, 'Notion index sync completed');
+    if (!this.vfs.isIndexed()) {
+      this.writeLine('(syncing Notion index...)');
+      const start = Date.now();
+      await this.vfs.refresh(false);
+      const durationMs = Date.now() - start;
+      this.writeLine(`(Notion index ready in ${durationMs}ms)`);
+      if (durationMs > 750) {
+        this.logger.info({ durationMs, force: false }, 'Notion index sync completed');
+      }
+      return;
+    }
+
+    const startedAt = Date.now();
+    void this.vfs
+      .refresh(false)
+      .then(() => {
+        const durationMs = Date.now() - startedAt;
+        if (durationMs > 750) {
+          this.logger.info({ durationMs, force: false }, 'Background Notion index refresh completed');
+        }
+      })
+      .catch((error) => {
+        this.logger.warn({ err: error }, 'Background Notion index refresh failed');
+      });
+
+    if (this.vfs.isRefreshing()) {
+      this.writeLine('(using cached index while background refresh runs)');
     }
   }
 
