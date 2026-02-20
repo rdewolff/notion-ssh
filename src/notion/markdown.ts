@@ -19,6 +19,22 @@ function textContent(content: string): any[] {
   ];
 }
 
+function calloutIconToPlain(icon: any): string {
+  if (!icon || typeof icon !== 'object') {
+    return '💬';
+  }
+
+  if (icon.type === 'emoji' && typeof icon.emoji === 'string' && icon.emoji.length > 0) {
+    return icon.emoji;
+  }
+
+  if (icon.type === 'custom_emoji' && icon.custom_emoji?.name) {
+    return `:${icon.custom_emoji.name}:`;
+  }
+
+  return '💬';
+}
+
 function renderListChildren(children: any[] | undefined, depth: number): string[] {
   if (!children || children.length === 0) {
     return [];
@@ -74,6 +90,17 @@ function renderBlock(block: any, depth = 0): string[] {
 
   if (type === 'quote') {
     return [`> ${richTextToPlain(block.quote?.rich_text)}`];
+  }
+
+  if (type === 'callout') {
+    const text = richTextToPlain(block.callout?.rich_text);
+    const icon = calloutIconToPlain(block.callout?.icon);
+    const base = text.length > 0 ? `> ${icon} ${text}` : `> ${icon}`;
+    const childLines = (children ?? [])
+      .flatMap((child: any) => renderBlock(child, 0))
+      .map((line: string) => (line.length > 0 ? `> ${line}` : '>'));
+
+    return [base, ...childLines];
   }
 
   if (type === 'code') {

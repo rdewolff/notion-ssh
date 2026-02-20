@@ -28,4 +28,28 @@ describe('markdown conversion', () => {
     expect(markdown).toContain('## Section');
     expect(markdown).toContain('Hello world');
   });
+
+  it('renders callout blocks as readable markdown', () => {
+    const markdown = notionBlocksToMarkdown([
+      {
+        id: 'callout-1',
+        type: 'callout',
+        callout: {
+          rich_text: [{ plain_text: 'Important note' }],
+          icon: { type: 'emoji', emoji: '💡' }
+        },
+        children: [
+          {
+            id: 'child-1',
+            type: 'paragraph',
+            paragraph: { rich_text: [{ plain_text: 'Nested detail' }] }
+          }
+        ]
+      }
+    ]);
+
+    expect(markdown).toContain('> 💡 Important note');
+    expect(markdown).toContain('> Nested detail');
+    expect(markdown).not.toContain('unsupported:callout');
+  });
 });

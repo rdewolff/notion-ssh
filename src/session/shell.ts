@@ -125,11 +125,11 @@ export class ShellSession {
     if (this.isClosed || this.channel.destroyed) {
       return;
     }
-    this.channel.write(text);
+    this.channel.write(text.replace(/\r?\n/g, '\r\n'));
   }
 
   private writeLine(text: string): void {
-    this.write(`${text}\r\n`);
+    this.write(`${text}\n`);
   }
 
   private promptLabel(): string {
@@ -413,7 +413,7 @@ export class ShellSession {
     }
 
     if (command === 'ls') {
-      await this.ensureIndexed();
+      await this.ensureIndexed(false, true);
 
       let longFormat = false;
       let target = this.cwd;
@@ -607,7 +607,7 @@ export class ShellSession {
     throw new Error(`Unknown command: ${command}`);
   }
 
-  private async ensureIndexed(force = false): Promise<void> {
+  private async ensureIndexed(force = false, quietCachedNotice = false): Promise<void> {
     if (force) {
       this.writeLine('(syncing Notion index...)');
       const start = Date.now();
@@ -645,7 +645,7 @@ export class ShellSession {
         this.logger.warn({ err: error }, 'Background Notion index refresh failed');
       });
 
-    if (this.vfs.isRefreshing()) {
+    if (this.vfs.isRefreshing() && !quietCachedNotice) {
       const now = Date.now();
       if (now - this.lastCachedNoticeAt > 15000) {
         this.writeLine('(using cached index while background refresh runs)');
