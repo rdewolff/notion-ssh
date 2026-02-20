@@ -221,6 +221,14 @@ export class NotionGateway {
     return notionBlocksToMarkdown(blocks);
   }
 
+  async getPageMeta(pageId: string): Promise<NotionRecordMeta> {
+    const page: any = await this.withRetry('pages.retrieve', async () => {
+      return this.client.pages.retrieve({ page_id: pageId });
+    });
+
+    return toRecordMeta(page);
+  }
+
   async replacePageMarkdown(pageId: string, markdown: string): Promise<void> {
     const existing = await this.listBlockChildren(pageId);
 

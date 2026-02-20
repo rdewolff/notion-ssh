@@ -367,8 +367,22 @@ export class VirtualFs {
     }
 
     const file = this.ensurePageFile(pathInput, cwd);
+    const remoteMeta = await this.notion.getPageMeta(file.pageId);
+    const expectedLastEditedTime = file.meta.lastEditedTime;
+    if (
+      expectedLastEditedTime &&
+      remoteMeta.lastEditedTime &&
+      remoteMeta.lastEditedTime !== expectedLastEditedTime
+    ) {
+      throw new Error(
+        `Conflict detected for ${file.path}. Remote page changed since last sync (remote: ${remoteMeta.lastEditedTime}, local: ${expectedLastEditedTime}). Run refresh and merge manually.`
+      );
+    }
+
     await this.notion.replacePageMarkdown(file.pageId, markdown);
-    file.meta.lastEditedTime = new Date().toISOString();
+    const updatedMeta = await this.notion.getPageMeta(file.pageId);
+    file.meta.lastEditedTime = updatedMeta.lastEditedTime;
+    file.meta.owner = updatedMeta.owner;
 
     this.cache.set(file.pageId, {
       markdown,
@@ -444,13 +458,12 @@ export class VirtualFs {
     const title = basename.replace(/\.md$/, '').replace(/[-_]+/g, ' ').trim() || 'Untitled';
     const parentPageId = parent.meta.pageId;
 
-    await this.notion.createPage(title, parentPageId);
+    const createdPage = await this.notion.createPage(title, parentPageId);
     await this.refresh();
 
-    const siblings = this.list(parentPath);
-    const maybeNew = siblings.find((entry) => entry.type === 'dir' && slugFromTitle(title) === entry.name);
-    if (maybeNew && maybeNew.type === 'dir') {
-      return posix.join(maybeNew.path, 'index.md');
+    const createdDir = this.pageDirPathById.get(createdPage.id);
+    if (createdDir) {
+      return posix.join(createdDir, 'index.md');
     }
 
     return resolved;
@@ -471,8 +484,13 @@ export class VirtualFs {
     const basename = posix.basename(resolved);
     const title = basename.replace(/[-_]+/g, ' ').trim() || 'Untitled';
     const parentPageId = parent.meta.pageId;
-    await this.notion.createPage(title, parentPageId);
+    const createdPage = await this.notion.createPage(title, parentPageId);
     await this.refresh();
+
+    const createdDir = this.pageDirPathById.get(createdPage.id);
+    if (createdDir) {
+      return createdDir;
+    }
 
     return resolved;
   }
